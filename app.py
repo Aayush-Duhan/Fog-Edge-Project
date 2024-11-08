@@ -22,6 +22,17 @@ import jwt
 import hashlib
 from collections import defaultdict
 import time
+import requests
+import json
+from dotenv import load_dotenv
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import pandas as pd
+from datetime import datetime, timedelta
+import boto3
+from boto3.dynamodb.conditions import Key
+
+load_dotenv()
 
 class KeyManager:
     def __init__(self, rotation_minutes: int = 10, max_keys: int = 3):
@@ -77,11 +88,195 @@ class ProcessDataSchema(Schema):
     key_id = fields.Int(required=True)
     signature = fields.Str(required=True)
 
+class CloudConnector:
+    def __init__(self, message_queue):
+        self.message_queue = message_queue
+        
+        # Load credentials from cloud_credentials.json
+        try:
+            with open('cloud_credentials.json', 'r') as f:
+                credentials = json.load(f)
+                self.cloud_endpoint = credentials['api_endpoint']
+                self.api_key = credentials['api_key']
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': "Cloud credentials loaded successfully",
+                    'level': 'SUCCESS'
+                })
+        except Exception as e:
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Failed to load cloud credentials: {str(e)}",
+                'level': 'ERROR'
+            })
+            self.cloud_endpoint = os.getenv('CLOUD_API_ENDPOINT', '')
+            self.api_key = os.getenv('CLOUD_API_KEY', '')
+        
+        self.batch_size = 10
+        self.data_buffer = []
+        self.check_cloud_connection()  # Add initial connection check
+
+    def check_cloud_connection(self):
+        """Check if cloud connection is working"""
+        try:
+            headers = {
+                'x-api-key': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            
+            # Send a test payload
+            test_data = {
+                'fog_id': 'FOG_001',
+                'data': [{
+                    'device_id': 'TEST',
+                    'message': 'Connection test',
+                    'processed_at': datetime.now().isoformat()
+                }]
+            }
+            
+            response = requests.post(
+                self.cloud_endpoint,
+                json=test_data,
+                headers=headers,
+                timeout=5  # Add timeout
+            )
+            
+            if response.status_code == 200:
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': "Cloud connection established successfully",
+                    'level': 'SUCCESS'
+                })
+                return True
+            else:
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': f"Cloud connection failed: {response.text}",
+                    'level': 'ERROR'
+                })
+                return False
+                
+        except Exception as e:
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Cloud connection error: {str(e)}",
+                'level': 'ERROR'
+            })
+            return False
+
+    def send_to_cloud(self, data):
+        """Send data to cloud with basic retry logic"""
+        try:
+            headers = {
+                'x-api-key': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            
+            # Add metadata
+            data_with_metadata = {
+                'fog_id': 'FOG_001',
+                'data': data if isinstance(data, list) else [data],
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Debug logging
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Sending to cloud endpoint: {self.cloud_endpoint}",
+                'level': 'INFO'
+            })
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Headers: {headers}",
+                'level': 'INFO'
+            })
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Data: {json.dumps(data_with_metadata)}",
+                'level': 'INFO'
+            })
+            
+            response = requests.post(
+                self.cloud_endpoint,
+                json=data_with_metadata,
+                headers=headers,
+                timeout=5
+            )
+            
+            # Debug response
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Cloud Response Status: {response.status_code}",
+                'level': 'INFO'
+            })
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Cloud Response: {response.text}",
+                'level': 'INFO'
+            })
+            
+            if response.status_code == 200:
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': "Data successfully sent to cloud",
+                    'level': 'SUCCESS'
+                })
+                return True
+            else:
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': f"Failed to send data to cloud: {response.text}",
+                    'level': 'ERROR'
+                })
+                return False
+                
+        except Exception as e:
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Cloud communication error: {str(e)}",
+                'level': 'ERROR'
+            })
+            return False
+
+    def buffer_data(self, data):
+        """Buffer data and send in batches"""
+        self.data_buffer.append(data)
+        
+        if len(self.data_buffer) >= self.batch_size:
+            success = self.send_to_cloud(self.data_buffer)
+            if success:
+                self.data_buffer = []
+            return success
+        
+        # If buffer isn't full yet, still send single items immediately
+        return self.send_to_cloud([data])
+
 class FogServerGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Fog Server Monitor")
         self.root.geometry("900x700")
+        
+        # Configure grid weight to allow resizing
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        
+        # Create canvas and scrollbar
+        self.canvas = tk.Canvas(root)
+        self.scrollbar = ttk.Scrollbar(root, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        
+        # Configure canvas
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        # Pack scrollbar and canvas
+        self.scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
         
         # Message queue for communication between Flask and GUI
         self.message_queue = queue.Queue()
@@ -92,7 +287,7 @@ class FogServerGUI:
         style.configure("Error.TLabel", foreground="red")
         
         # Create main frame
-        main_frame = ttk.Frame(root, padding="10")
+        main_frame = ttk.Frame(self.scrollable_frame, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Server status frame
@@ -163,6 +358,34 @@ class FogServerGUI:
         self.device_tree.column("#0", width=0, stretch=tk.NO)
         self.device_tree.grid(row=0, column=0, sticky=(tk.W, tk.E))
 
+        # Add Cloud Status frame
+        cloud_frame = ttk.LabelFrame(main_frame, text="Cloud Connection", padding="5")
+        cloud_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        self.cloud_status = ttk.Label(cloud_frame, text="⚪ Cloud: Not Connected")
+        self.cloud_status.grid(row=0, column=0, padx=5)
+        
+        self.cloud_sync = ttk.Label(cloud_frame, text="📤 Last Sync: Never")
+        self.cloud_sync.grid(row=0, column=1, padx=5)
+        
+        # Initialize cloud connector
+        self.cloud_connector = CloudConnector(self.message_queue)
+
+        # Add mouse wheel binding
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        # Add Data Visualization Panel
+        self.data_viz = DataVisualizationPanel(main_frame, self.message_queue)
+
+        # Add refresh timer
+        self.root.after(60000, self.refresh_visualization)  # Refresh every minute
+
+        # Add periodic device status update
+        self.root.after(5000, self.check_device_status)  # Check every 5 seconds
+
+        # Add periodic device refresh
+        self.root.after(1000, self.refresh_device_monitor)  # Refresh every second
+
     def log_message(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         if level == "ERROR":
@@ -197,6 +420,13 @@ class FogServerGUI:
             self.start_button.config(state='disabled')
             self.stop_button.config(state='normal')
             self.log_message("Server started successfully", "SUCCESS")
+            
+            # Check cloud connection
+            if self.cloud_connector.check_cloud_connection():
+                self.cloud_status.config(text="🟢 Cloud: Connected")
+            else:
+                self.cloud_status.config(text="🔴 Cloud: Error")
+            
             self.server_thread = threading.Thread(target=run_flask_app, args=(self.message_queue,))
             self.server_thread.daemon = True
             self.server_thread.start()
@@ -218,32 +448,92 @@ class FogServerGUI:
                 message = self.message_queue.get_nowait()
                 if message['type'] == 'log':
                     self.log_message(message['content'], message.get('level', 'INFO'))
+                    
+                    # Update cloud status if message is related to cloud
+                    if 'cloud' in message['content'].lower():
+                        if message['level'] == 'SUCCESS':
+                            self.cloud_status.config(text="🟢 Cloud: Connected")
+                            self.cloud_sync.config(text=f"📤 Last Sync: {datetime.now().strftime('%H:%M:%S')}")
+                        elif message['level'] == 'ERROR':
+                            self.cloud_status.config(text="🔴 Cloud: Error")
+                
                 elif message['type'] == 'key_update':
                     self.update_key_tree(message['keychain'])
                 elif message['type'] == 'request_count':
                     self.request_count += 1
                     self.requests_count.config(text=f"Requests: {self.request_count}")
+                elif message['type'] == 'device_update':
+                    self.update_device_tree(message['devices'])
+                
         except queue.Empty:
             pass
         finally:
             self.root.after(100, self.check_messages)
 
     def update_device_tree(self, devices):
+        """Update the device monitor tree"""
+        # Clear existing items
         for item in self.device_tree.get_children():
             self.device_tree.delete(item)
         
+        # Add current devices
         for device_id, device_data in devices.items():
-            status = "🟢 Active" if (datetime.now() - device_data["last_active"]).seconds < 300 else "⚪ Inactive"
+            # Convert string timestamps back to datetime for comparison
+            last_active = datetime.strptime(device_data["last_active"], "%Y-%m-%d %H:%M:%S")
+            
+            # Determine status
+            if (datetime.now() - last_active).seconds < 300:  # 5 minutes
+                status = "🟢 Active"
+            else:
+                status = "⚪ Inactive"
+            
             if device_id in device_data.get("blacklist", []):
                 status = "🔴 Blacklisted"
             
+            # Insert device into tree
             self.device_tree.insert("", "end", values=(
                 device_id,
                 device_data["device_type"],
                 status,
-                device_data["last_active"].strftime("%Y-%m-%d %H:%M:%S"),
+                device_data["last_active"],
                 device_data["failed_attempts"]
             ))
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling"""
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+    def refresh_visualization(self):
+        """Refresh visualization periodically"""
+        if self.server_running:
+            self.data_viz.refresh_data()
+        self.root.after(60000, self.refresh_visualization)
+
+    def check_device_status(self):
+        """Update device status periodically"""
+        for item in self.device_tree.get_children():
+            device_id = self.device_tree.item(item)['values'][0]
+            last_active = datetime.strptime(
+                self.device_tree.item(item)['values'][3], 
+                "%Y-%m-%d %H:%M:%S"
+            )
+            
+            # Update status based on last activity
+            if (datetime.now() - last_active).seconds > 300:  # 5 minutes
+                self.device_tree.set(item, "Status", "⚪ Inactive")
+        
+        # Schedule next check
+        self.root.after(5000, self.check_device_status)
+
+    def refresh_device_monitor(self):
+        """Periodically refresh device monitor"""
+        if self.server_running:
+            # Request device update
+            if hasattr(self, 'device_registry'):
+                self.device_registry.update_gui()
+        
+        # Schedule next refresh
+        self.root.after(1000, self.refresh_device_monitor)
 
 class InMemoryRateLimiter:
     def __init__(self):
@@ -271,6 +561,28 @@ class DeviceRegistry:
         self.blacklist = set()
         self.suspicious_activity = {}
         self.rate_limiter = InMemoryRateLimiter()
+        self.message_queue = None
+
+    def set_message_queue(self, queue):
+        self.message_queue = queue
+
+    def update_gui(self):
+        """Send device update to GUI"""
+        if self.message_queue:
+            # Convert datetime objects to strings for JSON serialization
+            devices_copy = {}
+            for device_id, device_data in self.devices.items():
+                devices_copy[device_id] = {
+                    **device_data,
+                    'registered_at': device_data['registered_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                    'last_active': device_data['last_active'].strftime("%Y-%m-%d %H:%M:%S")
+                }
+            
+            self.message_queue.put({
+                'type': 'device_update',
+                'devices': devices_copy,
+                'blacklist': list(self.blacklist)
+            })
 
     def register_device(self, device_id, api_key, device_type, capabilities, public_key):
         if device_id in self.blacklist:
@@ -288,6 +600,7 @@ class DeviceRegistry:
             "last_active": datetime.now(),
             "failed_attempts": 0
         }
+        self.update_gui()  # Update GUI after registration
         return True, "Device registered successfully"
 
     def validate_device(self, device_id, api_key):
@@ -304,16 +617,218 @@ class DeviceRegistry:
             device["failed_attempts"] += 1
             if device["failed_attempts"] >= 5:
                 self.blacklist.add(device_id)
+                self.update_gui()  # Update GUI after blacklisting
                 return False, "Device blacklisted due to multiple failed attempts"
+            self.update_gui()  # Update GUI after failed attempt
             return False, "Invalid API key"
         
         # Check rate limit
         if not self.rate_limiter.is_allowed(device_id):
             return False, "Rate limit exceeded"
         
+        # Update last active time
         device["last_active"] = datetime.now()
         device["failed_attempts"] = 0
+        self.update_gui()  # Update GUI after successful validation
         return True, "Device validated"
+
+    def get_device_status(self, device_id):
+        """Get current status of a device"""
+        if device_id not in self.devices:
+            return "Not Registered"
+        
+        if device_id in self.blacklist:
+            return "🔴 Blacklisted"
+        
+        device = self.devices[device_id]
+        time_since_active = (datetime.now() - device["last_active"]).total_seconds()
+        
+        if time_since_active < 300:  # 5 minutes
+            return "🟢 Active"
+        else:
+            return "⚪ Inactive"
+
+class DataVisualizationPanel:
+    def __init__(self, parent_frame, message_queue):
+        self.parent_frame = parent_frame
+        self.message_queue = message_queue
+        
+        # Create visualization frame
+        self.frame = ttk.LabelFrame(parent_frame, text="Data Visualization", padding="5")
+        self.frame.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        # Controls frame
+        controls_frame = ttk.Frame(self.frame)
+        controls_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        # Time range selector
+        ttk.Label(controls_frame, text="Time Range:").grid(row=0, column=0, padx=5)
+        self.time_range = ttk.Combobox(controls_frame, 
+            values=["Last Hour", "Last Day", "Last Week"],
+            state="readonly", width=15)
+        self.time_range.set("Last Hour")
+        self.time_range.grid(row=0, column=1, padx=5)
+        
+        # Device selector
+        ttk.Label(controls_frame, text="Device:").grid(row=0, column=2, padx=5)
+        self.device_selector = ttk.Combobox(controls_frame, state="readonly", width=15)
+        self.device_selector.grid(row=0, column=3, padx=5)
+        
+        # Refresh button
+        self.refresh_btn = ttk.Button(controls_frame, text="Refresh", command=self.refresh_data)
+        self.refresh_btn.grid(row=0, column=4, padx=5)
+        
+        # Create matplotlib figure
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.frame)
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Initialize data
+        self.update_device_list()
+        self.refresh_data()
+        
+        # Bind events
+        self.time_range.bind('<<ComboboxSelected>>', lambda e: self.refresh_data())
+        self.device_selector.bind('<<ComboboxSelected>>', lambda e: self.refresh_data())
+
+    def update_device_list(self):
+        try:
+            # Connect to DynamoDB
+            dynamodb = boto3.resource('dynamodb')
+            table = dynamodb.Table('fog_data')
+            
+            # Get unique device IDs
+            response = table.scan(
+                ProjectionExpression='device_id',
+                Select='SPECIFIC_ATTRIBUTES'
+            )
+            
+            devices = set(item['device_id'] for item in response['Items'])
+            self.device_selector['values'] = list(devices)
+            if devices:
+                self.device_selector.set(list(devices)[0])
+                
+        except Exception as e:
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Failed to update device list: {str(e)}",
+                'level': 'ERROR'
+            })
+
+    def get_time_range(self):
+        range_str = self.time_range.get()
+        now = datetime.now()
+        
+        if range_str == "Last Hour":
+            return now - timedelta(hours=1)
+        elif range_str == "Last Day":
+            return now - timedelta(days=1)
+        else:  # Last Week
+            return now - timedelta(weeks=1)
+
+    def refresh_data(self):
+        try:
+            # Clear previous plots
+            self.ax1.clear()
+            self.ax2.clear()
+            
+            # Get selected device
+            device_id = self.device_selector.get()
+            if not device_id:
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': "No device selected. Please select a device.",
+                    'level': 'INFO'
+                })
+                # Add default text to plots
+                self.ax1.text(0.5, 0.5, 'No device selected', 
+                    horizontalalignment='center', verticalalignment='center')
+                self.ax2.text(0.5, 0.5, 'Please select a device', 
+                    horizontalalignment='center', verticalalignment='center')
+                self.fig.tight_layout()
+                self.canvas.draw()
+                return
+            
+            # Get data from DynamoDB
+            dynamodb = boto3.resource('dynamodb')
+            table = dynamodb.Table('fog_data')
+            
+            start_time = self.get_time_range().isoformat()
+            
+            # Query DynamoDB
+            try:
+                response = table.query(
+                    KeyConditionExpression=Key('device_id').eq(device_id) & 
+                                         Key('timestamp').gt(start_time)
+                )
+                
+                if not response['Items']:
+                    self.message_queue.put({
+                        'type': 'log',
+                        'content': f"No data available for device {device_id} in selected time range",
+                        'level': 'INFO'
+                    })
+                    # Add informative text to plots
+                    self.ax1.text(0.5, 0.5, 'No data available', 
+                        horizontalalignment='center', verticalalignment='center')
+                    self.ax2.text(0.5, 0.5, 'Try different time range', 
+                        horizontalalignment='center', verticalalignment='center')
+                    self.fig.tight_layout()
+                    self.canvas.draw()
+                    return
+                
+                # Convert to pandas DataFrame
+                df = pd.DataFrame(response['Items'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.sort_values('timestamp')
+                
+                # Plot message frequency over time
+                message_freq = df.resample('5T', on='timestamp').size()
+                self.ax1.plot(message_freq.index, message_freq.values, marker='o')
+                self.ax1.set_title('Message Frequency Over Time')
+                self.ax1.set_xlabel('Time')
+                self.ax1.set_ylabel('Messages per 5 minutes')
+                self.ax1.tick_params(axis='x', rotation=45)
+                
+                # Plot message types/patterns
+                message_types = df['message'].value_counts()
+                self.ax2.bar(message_types.index, message_types.values)
+                self.ax2.set_title('Message Types Distribution')
+                self.ax2.set_xlabel('Message')
+                self.ax2.set_ylabel('Count')
+                self.ax2.tick_params(axis='x', rotation=45)
+                
+                # Adjust layout and display
+                self.fig.tight_layout()
+                self.canvas.draw()
+                
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': "Data visualization updated successfully",
+                    'level': 'SUCCESS'
+                })
+                
+            except Exception as e:
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': f"Failed to query DynamoDB: {str(e)}",
+                    'level': 'ERROR'
+                })
+                raise
+                
+        except Exception as e:
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Failed to refresh data: {str(e)}",
+                'level': 'ERROR'
+            })
+            # Show error in plots
+            self.ax1.text(0.5, 0.5, 'Error refreshing data', 
+                horizontalalignment='center', verticalalignment='center')
+            self.ax2.text(0.5, 0.5, str(e), 
+                horizontalalignment='center', verticalalignment='center')
+            self.fig.tight_layout()
+            self.canvas.draw()
 
 def create_app(message_queue):
     app = Flask(__name__)
@@ -340,13 +855,18 @@ def create_app(message_queue):
         default_limits=["200 per day", "50 per hour"]
     )
     
+    # Initialize cloud connector
+    app.cloud_connector = CloudConnector(message_queue)
+    
     # Disable SSL for development
     app.config['PREFERRED_URL_SCHEME'] = 'http'
     
     # Initialize Redis for device registry and rate limiting
     rate_limiter = InMemoryRateLimiter()
 
+    # Initialize device registry with message queue
     device_registry = DeviceRegistry()
+    device_registry.set_message_queue(message_queue)
 
     # Add rate limiting by device ID
     def rate_limit_by_device(device_id):
@@ -511,8 +1031,17 @@ def create_app(message_queue):
                 })
                 return jsonify({"error": "Decryption failed"}), 500
 
+            # After successful processing, send to cloud
+            cloud_data = {
+                'device_id': device_id,
+                'message': decrypted_message,
+                'processed_at': datetime.now().isoformat()
+            }
+            
+            app.cloud_connector.buffer_data(cloud_data)
+            
             return jsonify({
-                "message": "Message received, verified, and decrypted",
+                "message": "Message received, verified, and processed",
                 "decrypted_message": decrypted_message
             })
             
@@ -601,6 +1130,118 @@ def create_app(message_queue):
                 'level': 'ERROR'
             })
             return jsonify({"error": str(e)}), 500
+
+    @app.route('/test-cloud', methods=['GET'])
+    @handle_errors
+    def test_cloud():
+        """Test cloud connection"""
+        try:
+            test_data = {
+                'device_id': 'TEST_DEVICE',
+                'message': 'Test message from fog server',
+                'processed_at': datetime.now().isoformat()
+            }
+            
+            message_queue.put({
+                'type': 'log',
+                'content': "Testing cloud connection...",
+                'level': 'INFO'
+            })
+            
+            success = app.cloud_connector.buffer_data(test_data)
+            
+            if success:
+                return jsonify({"message": "Cloud test successful"}), 200
+            else:
+                return jsonify({"error": "Cloud test failed"}), 500
+                
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # Add this route after the test-cloud route
+    @app.route('/generate-test-data', methods=['GET'])
+    @handle_errors
+    def generate_test_data():
+        """Generate test data for visualization"""
+        try:
+            test_messages = [
+                "Temperature: 25°C",
+                "Temperature: 26°C",
+                "Temperature: 24°C",
+                "Humidity: 65%",
+                "Humidity: 70%",
+                "Status: Normal",
+                "Status: Warning",
+                "Pressure: 1013 hPa",
+                "CO2: 400 ppm",
+                "Motion: Detected"
+            ]
+            
+            message_queue.put({
+                'type': 'log',
+                'content': "Starting test data generation...",
+                'level': 'INFO'
+            })
+            
+            success_count = 0
+            for message in test_messages:
+                test_data = {
+                    'device_id': 'TEST_DEVICE',
+                    'message': message,
+                    'processed_at': datetime.now().isoformat()
+                }
+                
+                if app.cloud_connector.buffer_data(test_data):
+                    success_count += 1
+                time.sleep(1)  # Wait between messages
+            
+            message_queue.put({
+                'type': 'log',
+                'content': f"Generated {success_count} test messages successfully",
+                'level': 'SUCCESS'
+            })
+                
+            return jsonify({
+                "message": f"Test data generated successfully ({success_count}/{len(test_messages)} messages)"
+            }), 200
+            
+        except Exception as e:
+            message_queue.put({
+                'type': 'log',
+                'content': f"Test data generation failed: {str(e)}",
+                'level': 'ERROR'
+            })
+            return jsonify({"error": str(e)}), 500
+
+    @app.route('/debug-data', methods=['GET'])
+    @handle_errors
+    def debug_data():
+        """Debug data storage"""
+        try:
+            # Generate test data
+            test_data = [
+                {
+                    'device_id': 'DEBUG_DEVICE',
+                    'message': f'Debug Message {i}',
+                    'processed_at': datetime.now().isoformat()
+                } for i in range(5)
+            ]
+            
+            # Send each message
+            results = []
+            for data in test_data:
+                success = app.cloud_connector.buffer_data(data)
+                results.append({
+                    'message': data['message'],
+                    'success': success
+                })
+            
+            return jsonify({
+                'message': 'Debug complete',
+                'results': results
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
 
     return app
 
