@@ -34,6 +34,9 @@ from boto3.dynamodb.conditions import Key
 
 load_dotenv()
 
+# Initialize shared components
+shared_device_registry = None  # Initialize as None first
+
 class KeyManager:
     def __init__(self, rotation_minutes: int = 10, max_keys: int = 3):
         self.keychain: Dict[int, Dict[str, Any]] = {}
@@ -251,6 +254,138 @@ class CloudConnector:
         # If buffer isn't full yet, still send single items immediately
         return self.send_to_cloud([data])
 
+class InMemoryRateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self.max_requests = 5  # Max requests per minute
+        self.time_window = 60  # Time window in seconds
+
+    def is_allowed(self, device_id):
+        now = time.time()
+        # Remove old requests
+        self.requests[device_id] = [
+            req_time for req_time in self.requests[device_id]
+            if now - req_time < self.time_window
+        ]
+        
+        # Check if under limit
+        if len(self.requests[device_id]) < self.max_requests:
+            self.requests[device_id].append(now)
+            return True
+        return False
+
+class DeviceRegistry:
+    def __init__(self):
+        self.devices = {}
+        self.blacklist = set()
+        self.suspicious_activity = {}
+        self.rate_limiter = InMemoryRateLimiter()
+        self.message_queue = None
+        self.alert_callbacks = {}  # Store callback functions for each device
+
+    def set_message_queue(self, queue):
+        self.message_queue = queue
+
+    def update_gui(self):
+        """Send device update to GUI"""
+        if self.message_queue:
+            # Convert datetime objects to strings for JSON serialization
+            devices_copy = {}
+            for device_id, device_data in self.devices.items():
+                devices_copy[device_id] = {
+                    **device_data,
+                    'registered_at': device_data['registered_at'].strftime("%Y-%m-%d %H:%M:%S"),
+                    'last_active': device_data['last_active'].strftime("%Y-%m-%d %H:%M:%S")
+                }
+            
+            self.message_queue.put({
+                'type': 'device_update',
+                'devices': devices_copy,
+                'blacklist': list(self.blacklist)
+            })
+
+    def register_device(self, device_id, api_key, device_type, capabilities, public_key):
+        if device_id in self.blacklist:
+            return False, "Device blacklisted"
+        
+        # Hash the API key for storage
+        api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        
+        self.devices[device_id] = {
+            "api_key_hash": api_key_hash,
+            "device_type": device_type,
+            "capabilities": capabilities,
+            "public_key": public_key,
+            "registered_at": datetime.now(),
+            "last_active": datetime.now(),
+            "failed_attempts": 0
+        }
+        self.update_gui()  # Update GUI after registration
+        return True, "Device registered successfully"
+
+    def validate_device(self, device_id, api_key):
+        if device_id not in self.devices:
+            return False, "Device not registered"
+        
+        if device_id in self.blacklist:
+            return False, "Device blacklisted"
+        
+        device = self.devices[device_id]
+        api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        
+        if api_key_hash != device["api_key_hash"]:
+            device["failed_attempts"] += 1
+            if device["failed_attempts"] >= 5:
+                self.blacklist.add(device_id)
+                self.update_gui()  # Update GUI after blacklisting
+                return False, "Device blacklisted due to multiple failed attempts"
+            self.update_gui()  # Update GUI after failed attempt
+            return False, "Invalid API key"
+        
+        # Check rate limit
+        if not self.rate_limiter.is_allowed(device_id):
+            return False, "Rate limit exceeded"
+        
+        # Update last active time
+        device["last_active"] = datetime.now()
+        device["failed_attempts"] = 0
+        self.update_gui()  # Update GUI after successful validation
+        return True, "Device validated"
+
+    def get_device_status(self, device_id):
+        """Get current status of a device"""
+        if device_id not in self.devices:
+            return "Not Registered"
+        
+        if device_id in self.blacklist:
+            return "🔴 Blacklisted"
+        
+        device = self.devices[device_id]
+        time_since_active = (datetime.now() - device["last_active"]).total_seconds()
+        
+        if time_since_active < 300:  # 5 minutes
+            return "🟢 Active"
+        else:
+            return "⚪ Inactive"
+
+    def register_alert_callback(self, device_id, callback):
+        """Register a callback function for alerts"""
+        self.alert_callbacks[device_id] = callback
+
+    def broadcast_alert(self, source_device_id, message):
+        """Send alert to all registered devices except the source"""
+        for device_id, callback in self.alert_callbacks.items():
+            if device_id != source_device_id:
+                try:
+                    callback(f"Alert from {source_device_id}: {message}")
+                except Exception as e:
+                    if self.message_queue:
+                        self.message_queue.put({
+                            'type': 'log',
+                            'content': f"Failed to send alert to {device_id}: {str(e)}",
+                            'level': 'ERROR'
+                        })
+
 class FogServerGUI:
     def __init__(self, root):
         self.root = root
@@ -374,11 +509,15 @@ class FogServerGUI:
         # Add mouse wheel binding
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
-        # Add Data Visualization Panel
-        self.data_viz = DataVisualizationPanel(main_frame, self.message_queue)
+        # Use the shared device registry instead of creating a new one
+        self.device_registry = shared_device_registry
+        self.device_registry.set_message_queue(self.message_queue)
+
+        # Create visualization panel with shared device registry
+        self.data_viz = DataVisualizationPanel(main_frame, self.message_queue, self.device_registry)
 
         # Add refresh timer
-        self.root.after(60000, self.refresh_visualization)  # Refresh every minute
+        self.root.after(60000, self.refresh_visualization)
 
         # Add periodic device status update
         self.root.after(5000, self.check_device_status)  # Check every 5 seconds
@@ -386,6 +525,27 @@ class FogServerGUI:
         # Add periodic device refresh
         self.root.after(1000, self.refresh_device_monitor)  # Refresh every second
 
+        # Add threshold configuration
+        self.threshold_value = 100.0  # Default threshold
+        
+        # Add threshold configuration frame
+        threshold_frame = ttk.LabelFrame(main_frame, text="Threshold Configuration", padding="5")
+        threshold_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(threshold_frame, text="Threshold Value:").grid(row=0, column=0, padx=5)
+        self.threshold_entry = ttk.Entry(threshold_frame)
+        self.threshold_entry.grid(row=0, column=1, padx=5)
+        self.threshold_entry.insert(0, str(self.threshold_value))
+        
+        ttk.Button(threshold_frame, text="Update Threshold", 
+                  command=self.update_threshold).grid(row=0, column=2, padx=5)
+
+        # Initialize Flask app and store reference
+        self.flask_app = None
+        
+        # Start Flask server
+        self.server_thread = None
+        
     def log_message(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         if level == "ERROR":
@@ -427,11 +587,23 @@ class FogServerGUI:
             else:
                 self.cloud_status.config(text="🔴 Cloud: Error")
             
-            self.server_thread = threading.Thread(target=run_flask_app, args=(self.message_queue,))
+            # Create and start Flask server
+            self.server_thread = threading.Thread(target=self.run_flask_server)
             self.server_thread.daemon = True
             self.server_thread.start()
+            
             # Open browser after a short delay
             self.root.after(1500, lambda: webbrowser.open('http://localhost:5000'))
+
+    def run_flask_server(self):
+        """Run Flask server and store app reference"""
+        self.flask_app = create_app(self.message_queue)
+        
+        # Set this GUI instance in the Flask app
+        if hasattr(self.flask_app, 'state'):
+            self.flask_app.state.gui = self
+            
+        self.flask_app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
 
     def stop_server(self):
         if self.server_running:
@@ -535,123 +707,77 @@ class FogServerGUI:
         # Schedule next refresh
         self.root.after(1000, self.refresh_device_monitor)
 
-class InMemoryRateLimiter:
-    def __init__(self):
-        self.requests = defaultdict(list)
-        self.max_requests = 5  # Max requests per minute
-        self.time_window = 60  # Time window in seconds
+    def update_threshold(self):
+        try:
+            new_threshold = float(self.threshold_entry.get())
+            self.threshold_value = new_threshold
+            self.log_message(f"Threshold updated to: {new_threshold}")
+        except ValueError:
+            self.log_message("Invalid threshold value. Please enter a number.")
 
-    def is_allowed(self, device_id):
-        now = time.time()
-        # Remove old requests
-        self.requests[device_id] = [
-            req_time for req_time in self.requests[device_id]
-            if now - req_time < self.time_window
-        ]
-        
-        # Check if under limit
-        if len(self.requests[device_id]) < self.max_requests:
-            self.requests[device_id].append(now)
-            return True
-        return False
-
-class DeviceRegistry:
-    def __init__(self):
-        self.devices = {}
-        self.blacklist = set()
-        self.suspicious_activity = {}
-        self.rate_limiter = InMemoryRateLimiter()
-        self.message_queue = None
-
-    def set_message_queue(self, queue):
-        self.message_queue = queue
-
-    def update_gui(self):
-        """Send device update to GUI"""
-        if self.message_queue:
-            # Convert datetime objects to strings for JSON serialization
-            devices_copy = {}
-            for device_id, device_data in self.devices.items():
-                devices_copy[device_id] = {
-                    **device_data,
-                    'registered_at': device_data['registered_at'].strftime("%Y-%m-%d %H:%M:%S"),
-                    'last_active': device_data['last_active'].strftime("%Y-%m-%d %H:%M:%S")
-                }
+    def process_message(self, message, client_address):
+        try:
+            # Split auth token and encrypted message
+            auth_token, encrypted_message = message.split("::")
             
-            self.message_queue.put({
-                'type': 'device_update',
-                'devices': devices_copy,
-                'blacklist': list(self.blacklist)
-            })
-
-    def register_device(self, device_id, api_key, device_type, capabilities, public_key):
-        if device_id in self.blacklist:
-            return False, "Device blacklisted"
-        
-        # Hash the API key for storage
-        api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-        
-        self.devices[device_id] = {
-            "api_key_hash": api_key_hash,
-            "device_type": device_type,
-            "capabilities": capabilities,
-            "public_key": public_key,
-            "registered_at": datetime.now(),
-            "last_active": datetime.now(),
-            "failed_attempts": 0
-        }
-        self.update_gui()  # Update GUI after registration
-        return True, "Device registered successfully"
-
-    def validate_device(self, device_id, api_key):
-        if device_id not in self.devices:
-            return False, "Device not registered"
-        
-        if device_id in self.blacklist:
-            return False, "Device blacklisted"
-        
-        device = self.devices[device_id]
-        api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-        
-        if api_key_hash != device["api_key_hash"]:
-            device["failed_attempts"] += 1
-            if device["failed_attempts"] >= 5:
-                self.blacklist.add(device_id)
-                self.update_gui()  # Update GUI after blacklisting
-                return False, "Device blacklisted due to multiple failed attempts"
-            self.update_gui()  # Update GUI after failed attempt
-            return False, "Invalid API key"
-        
-        # Check rate limit
-        if not self.rate_limiter.is_allowed(device_id):
-            return False, "Rate limit exceeded"
-        
-        # Update last active time
-        device["last_active"] = datetime.now()
-        device["failed_attempts"] = 0
-        self.update_gui()  # Update GUI after successful validation
-        return True, "Device validated"
-
-    def get_device_status(self, device_id):
-        """Get current status of a device"""
-        if device_id not in self.devices:
-            return "Not Registered"
-        
-        if device_id in self.blacklist:
-            return "🔴 Blacklisted"
-        
-        device = self.devices[device_id]
-        time_since_active = (datetime.now() - device["last_active"]).total_seconds()
-        
-        if time_since_active < 300:  # 5 minutes
-            return "🟢 Active"
-        else:
-            return "⚪ Inactive"
+            # Get the key from key manager
+            if hasattr(self.flask_app, 'key_manager'):
+                key_data = self.flask_app.key_manager.get_key(self.flask_app.key_manager.current_key_id)
+                if key_data:
+                    cipher_suite = Fernet(key_data["key"].encode())
+                    decrypted_message = cipher_suite.decrypt(encrypted_message.encode()).decode()
+                    
+                    try:
+                        # Convert the decrypted message to float
+                        float_value = float(decrypted_message)
+                        
+                        # Check threshold and prepare response
+                        if float_value > self.threshold_value:
+                            # Send to cloud when threshold is exceeded
+                            cloud_data = {
+                                'device_id': client_address,
+                                'message': f"ALERT: Value {float_value} exceeded threshold {self.threshold_value}",
+                                'value': float_value,
+                                'threshold': self.threshold_value,
+                                'processed_at': datetime.now().isoformat()
+                            }
+                            
+                            # Send alert to cloud
+                            if self.cloud_connector.buffer_data(cloud_data):
+                                self.log_message(f"Alert! Value {float_value} exceeded threshold {self.threshold_value}. Alert sent to cloud.", "WARNING")
+                                
+                                # Broadcast alert to all devices
+                                if hasattr(self, 'device_registry'):
+                                    self.device_registry.broadcast_alert(
+                                        client_address,
+                                        f"Threshold Exceeded (Value: {float_value})"
+                                    )
+                            else:
+                                self.log_message("Failed to send alert to cloud", "ERROR")
+                            
+                            response = "Threshold Exceeded"
+                        else:
+                            response = str(float_value)
+                            self.log_message(f"Received value: {float_value} (below threshold)")
+                        
+                    except ValueError:
+                        response = "Error: Invalid numeric value"
+                        self.log_message(f"Error: Received invalid numeric value: {decrypted_message}")
+                    
+                    # Encrypt the response
+                    return cipher_suite.encrypt(response.encode()).decode()
+            
+            return self.encrypt_message("Error: Invalid key")
+            
+        except Exception as e:
+            self.log_message(f"Error processing message: {str(e)}")
+            return self.encrypt_message("Error processing message")
 
 class DataVisualizationPanel:
-    def __init__(self, parent_frame, message_queue):
+    def __init__(self, parent_frame, message_queue, device_registry):
         self.parent_frame = parent_frame
         self.message_queue = message_queue
+        self.device_registry = device_registry  # Store device registry reference
         
         # Create visualization frame
         self.frame = ttk.LabelFrame(parent_frame, text="Data Visualization", padding="5")
@@ -678,6 +804,10 @@ class DataVisualizationPanel:
         self.refresh_btn = ttk.Button(controls_frame, text="Refresh", command=self.refresh_data)
         self.refresh_btn.grid(row=0, column=4, padx=5)
         
+        # Add device refresh button
+        ttk.Button(controls_frame, text="Refresh Devices", 
+                  command=self.update_device_list).grid(row=0, column=5, padx=5)
+        
         # Create matplotlib figure
         self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8))
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.frame)
@@ -692,21 +822,33 @@ class DataVisualizationPanel:
         self.device_selector.bind('<<ComboboxSelected>>', lambda e: self.refresh_data())
 
     def update_device_list(self):
+        """Update the device selector with all registered devices"""
         try:
-            # Connect to DynamoDB
-            dynamodb = boto3.resource('dynamodb')
-            table = dynamodb.Table('fog_data')
-            
-            # Get unique device IDs
-            response = table.scan(
-                ProjectionExpression='device_id',
-                Select='SPECIFIC_ATTRIBUTES'
-            )
-            
-            devices = set(item['device_id'] for item in response['Items'])
-            self.device_selector['values'] = list(devices)
-            if devices:
-                self.device_selector.set(list(devices)[0])
+            # Use the stored device registry reference
+            if self.device_registry:
+                registered_devices = list(self.device_registry.devices.keys())
+                
+                # Update device selector
+                current_selection = self.device_selector.get()  # Save current selection
+                self.device_selector['values'] = registered_devices
+                
+                # Restore previous selection if it still exists
+                if current_selection in registered_devices:
+                    self.device_selector.set(current_selection)
+                elif registered_devices:
+                    self.device_selector.set(registered_devices[0])
+                
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': f"Found {len(registered_devices)} registered devices",
+                    'level': 'INFO'
+                })
+            else:
+                self.message_queue.put({
+                    'type': 'log',
+                    'content': "Device registry not available",
+                    'level': 'ERROR'
+                })
                 
         except Exception as e:
             self.message_queue.put({
@@ -727,6 +869,9 @@ class DataVisualizationPanel:
             return now - timedelta(weeks=1)
 
     def refresh_data(self):
+        # Update device list before refreshing data
+        self.update_device_list()
+        
         try:
             # Clear previous plots
             self.ax1.clear()
@@ -740,7 +885,6 @@ class DataVisualizationPanel:
                     'content': "No device selected. Please select a device.",
                     'level': 'INFO'
                 })
-                # Add default text to plots
                 self.ax1.text(0.5, 0.5, 'No device selected', 
                     horizontalalignment='center', verticalalignment='center')
                 self.ax2.text(0.5, 0.5, 'Please select a device', 
@@ -768,7 +912,6 @@ class DataVisualizationPanel:
                         'content': f"No data available for device {device_id} in selected time range",
                         'level': 'INFO'
                     })
-                    # Add informative text to plots
                     self.ax1.text(0.5, 0.5, 'No data available', 
                         horizontalalignment='center', verticalalignment='center')
                     self.ax2.text(0.5, 0.5, 'Try different time range', 
@@ -782,20 +925,70 @@ class DataVisualizationPanel:
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df = df.sort_values('timestamp')
                 
+                # Extract values from messages and create new columns
+                def extract_value(msg):
+                    if 'ALERT: Value' in str(msg):
+                        try:
+                            # Extract just the value from "ALERT: Value X exceeded threshold Y"
+                            return float(msg.split(' ')[2])
+                        except:
+                            return None
+                    return None
+
+                # Add value column for threshold exceeded data
+                df['extracted_value'] = df['message'].apply(extract_value)
+                
+                # Separate normal and threshold exceeded data
+                threshold_data = df[df['message'].str.contains('ALERT', na=False)].copy()
+                normal_data = df[~df['message'].str.contains('ALERT', na=False)].copy()
+                
                 # Plot message frequency over time
-                message_freq = df.resample('5T', on='timestamp').size()
-                self.ax1.plot(message_freq.index, message_freq.values, marker='o')
+                if not normal_data.empty:
+                    normal_freq = normal_data.resample('5T', on='timestamp').size()
+                    self.ax1.plot(normal_freq.index, normal_freq.values, 
+                                marker='o', color='blue', label='Normal Values')
+                
+                if not threshold_data.empty:
+                    threshold_freq = threshold_data.resample('5T', on='timestamp').size()
+                    self.ax1.plot(threshold_freq.index, threshold_freq.values, 
+                                marker='o', color='red', label='Exceeded Values')
+                
                 self.ax1.set_title('Message Frequency Over Time')
                 self.ax1.set_xlabel('Time')
                 self.ax1.set_ylabel('Messages per 5 minutes')
                 self.ax1.tick_params(axis='x', rotation=45)
+                self.ax1.legend()
                 
-                # Plot message types/patterns
-                message_types = df['message'].value_counts()
-                self.ax2.bar(message_types.index, message_types.values)
-                self.ax2.set_title('Message Types Distribution')
-                self.ax2.set_xlabel('Message')
-                self.ax2.set_ylabel('Count')
+                # Plot value distribution
+                if 'value' in df.columns or 'extracted_value' in df.columns:
+                    values = df['value'] if 'value' in df.columns else df['extracted_value']
+                    values = values.dropna().astype(float)
+                    
+                    if not values.empty:
+                        self.ax2.hist(values, bins=20, color='blue', alpha=0.7, 
+                                    label='All Values')
+                        
+                        if 'threshold' in df.columns and not df['threshold'].empty:
+                            threshold = float(df['threshold'].iloc[0])
+                            self.ax2.axvline(x=threshold, color='red', 
+                                           linestyle='--', label=f'Threshold ({threshold})')
+                        
+                        self.ax2.set_title('Value Distribution')
+                        self.ax2.set_xlabel('Value')
+                        self.ax2.set_ylabel('Count')
+                        self.ax2.legend()
+                else:
+                    # Simplified message type display
+                    message_counts = pd.Series({
+                        'Normal': len(normal_data),
+                        'Exceeded': len(threshold_data)
+                    })
+                    colors = ['blue', 'red']
+                    self.ax2.bar(message_counts.index, message_counts.values, color=colors)
+                    self.ax2.set_title('Message Type Distribution')
+                    self.ax2.set_xlabel('Type')
+                    self.ax2.set_ylabel('Count')
+                
                 self.ax2.tick_params(axis='x', rotation=45)
                 
                 # Adjust layout and display
@@ -822,13 +1015,16 @@ class DataVisualizationPanel:
                 'content': f"Failed to refresh data: {str(e)}",
                 'level': 'ERROR'
             })
-            # Show error in plots
             self.ax1.text(0.5, 0.5, 'Error refreshing data', 
                 horizontalalignment='center', verticalalignment='center')
             self.ax2.text(0.5, 0.5, str(e), 
                 horizontalalignment='center', verticalalignment='center')
             self.fig.tight_layout()
             self.canvas.draw()
+
+def initialize_shared_components():
+    global shared_device_registry
+    shared_device_registry = DeviceRegistry()
 
 def create_app(message_queue):
     app = Flask(__name__)
@@ -861,16 +1057,22 @@ def create_app(message_queue):
     # Disable SSL for development
     app.config['PREFERRED_URL_SCHEME'] = 'http'
     
-    # Initialize Redis for device registry and rate limiting
-    rate_limiter = InMemoryRateLimiter()
-
-    # Initialize device registry with message queue
-    device_registry = DeviceRegistry()
+    # Use the shared device registry
+    device_registry = shared_device_registry
     device_registry.set_message_queue(message_queue)
+    
+    # Initialize rate limiter
+    rate_limiter = InMemoryRateLimiter()
 
     # Add rate limiting by device ID
     def rate_limit_by_device(device_id):
         return rate_limiter.is_allowed(device_id)
+
+    # Create an instance of FogServerGUI to handle message processing
+    class AppState:
+        pass
+    app.state = AppState()
+    app.state.gui = None
 
     @app.route('/get-current-key', methods=['GET'])
     @handle_errors
@@ -933,21 +1135,6 @@ def create_app(message_queue):
                 'level': 'SUCCESS'
             })
 
-            # Check rate limit
-            if not rate_limit_by_device(device_id):
-                message_queue.put({
-                    'type': 'log',
-                    'content': f"STEP 5: Rate limit exceeded for device: {device_id}",
-                    'level': 'ERROR'
-                })
-                return jsonify({"error": "Rate limit exceeded"}), 429
-            
-            message_queue.put({
-                'type': 'log',
-                'content': "STEP 5: Rate limit check passed",
-                'level': 'SUCCESS'
-            })
-
             # Process the message
             combined_data = data['combined_data']
             key_id = data['key_id']
@@ -958,91 +1145,25 @@ def create_app(message_queue):
             if not key_data or key_data['expiration'] < datetime.now():
                 message_queue.put({
                     'type': 'log',
-                    'content': f"STEP 6: Invalid or expired key ID: {key_id}",
+                    'content': f"STEP 5: Invalid or expired key ID: {key_id}",
                     'level': 'ERROR'
                 })
                 return jsonify({"error": "Invalid or expired key ID"}), 403
             
-            message_queue.put({
-                'type': 'log',
-                'content': "STEP 6: Encryption key validated",
-                'level': 'SUCCESS'
-            })
-
-            # Verify the digital signature
-            if not verify_signature(combined_data, signature):
+            # Process the message using the GUI instance
+            if app.state.gui:
+                response = app.state.gui.process_message(combined_data, device_id)
+            else:
                 message_queue.put({
                     'type': 'log',
-                    'content': "STEP 7: Digital signature verification failed",
+                    'content': "GUI instance not available",
                     'level': 'ERROR'
                 })
-                return jsonify({"error": "Invalid signature"}), 403
-            
-            message_queue.put({
-                'type': 'log',
-                'content': "STEP 7: Digital signature verified",
-                'level': 'SUCCESS'
-            })
-
-            # Split the combined data
-            auth_token, encrypted_message = combined_data.split("::")
-            message_queue.put({
-                'type': 'log',
-                'content': "STEP 8: Split auth token and encrypted message",
-                'level': 'SUCCESS'
-            })
-
-            # Validate the auth token
-            if not validate_auth_token(auth_token):
-                message_queue.put({
-                    'type': 'log',
-                    'content': "STEP 9: Auth token validation failed",
-                    'level': 'ERROR'
-                })
-                return jsonify({"error": "Invalid auth token"}), 403
-            
-            message_queue.put({
-                'type': 'log',
-                'content': "STEP 9: Auth token validated",
-                'level': 'SUCCESS'
-            })
-
-            # Decrypt the message
-            try:
-                message_queue.put({
-                    'type': 'log',
-                    'content': "STEP 10: Attempting message decryption",
-                    'level': 'INFO'
-                })
-                
-                cipher_suite = Fernet(key_data["key"].encode())
-                decrypted_message = cipher_suite.decrypt(encrypted_message.encode()).decode()
-                
-                message_queue.put({
-                    'type': 'log',
-                    'content': f"STEP 10: Successfully decrypted message: {decrypted_message}",
-                    'level': 'SUCCESS'
-                })
-            except Exception as e:
-                message_queue.put({
-                    'type': 'log',
-                    'content': f"STEP 10: Decryption failed: {str(e)}",
-                    'level': 'ERROR'
-                })
-                return jsonify({"error": "Decryption failed"}), 500
-
-            # After successful processing, send to cloud
-            cloud_data = {
-                'device_id': device_id,
-                'message': decrypted_message,
-                'processed_at': datetime.now().isoformat()
-            }
-            
-            app.cloud_connector.buffer_data(cloud_data)
+                return jsonify({"error": "Server not ready"}), 500
             
             return jsonify({
-                "message": "Message received, verified, and processed",
-                "decrypted_message": decrypted_message
+                "message": "Message processed successfully",
+                "decrypted_message": response
             })
             
         except ValidationError as err:
@@ -1115,6 +1236,9 @@ def create_app(message_queue):
                     'content': f"New device registered: {data['device_id']}",
                     'level': 'SUCCESS'
                 })
+                # Force update of device list in GUI
+                if app.state.gui and hasattr(app.state.gui, 'data_viz'):
+                    app.state.gui.data_viz.update_device_list()
                 return jsonify({"message": message}), 200
             else:
                 message_queue.put({
@@ -1243,17 +1367,52 @@ def create_app(message_queue):
         except Exception as e:
             return jsonify({'error': str(e)}), 500
 
-    return app
+    @app.route('/get-alerts', methods=['GET'])
+    @handle_errors
+    def get_alerts():
+        """Endpoint for devices to poll for alerts with optimization"""
+        device_id = request.args.get('device_id')
+        last_alert_time = request.args.get('last_alert_time')
+        
+        if not device_id:
+            return jsonify({"error": "Device ID required"}), 400
+        
+        try:
+            # Convert last_alert_time to datetime if provided
+            if last_alert_time:
+                last_alert_time = datetime.fromisoformat(last_alert_time)
+            
+            # Get only new alerts since last check
+            alerts = []  # You'll implement alert storage
+            
+            # Add rate limiting information to response
+            return jsonify({
+                "alerts": alerts,
+                "next_poll": 10  # Suggest client wait 10 seconds
+            })
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
-def run_flask_app(message_queue):
-    app = create_app(message_queue)
-    # Make sure to bind to all interfaces
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+    # Store key_manager and cloud_connector in app for GUI access
+    app.key_manager = key_manager
+    app.cloud_connector = CloudConnector(message_queue)
+    
+    # Initialize app state
+    app.state = AppState()
+    app.state.gui = None
+    
+    return app
 
 def main():
     root = tk.Tk()
-    app = FogServerGUI(root)
+    gui = FogServerGUI(root)
     root.mainloop()
 
 if __name__ == '__main__':
+    # Initialize shared components first
+    initialize_shared_components()
+    # Then set message queue
+    shared_device_registry.set_message_queue(queue.Queue())
+    # Finally start the main application
     main()
