@@ -282,6 +282,7 @@ class DeviceRegistry:
         self.rate_limiter = InMemoryRateLimiter()
         self.message_queue = None
         self.alert_callbacks = {}  # Store callback functions for each device
+        self.alerts = []  # Store recent alerts
 
     def set_message_queue(self, queue):
         self.message_queue = queue
@@ -372,19 +373,25 @@ class DeviceRegistry:
         """Register a callback function for alerts"""
         self.alert_callbacks[device_id] = callback
 
-    def broadcast_alert(self, source_device_id, message):
-        """Send alert to all registered devices except the source"""
-        for device_id, callback in self.alert_callbacks.items():
-            if device_id != source_device_id:
-                try:
-                    callback(f"Alert from {source_device_id}: {message}")
-                except Exception as e:
-                    if self.message_queue:
-                        self.message_queue.put({
-                            'type': 'log',
-                            'content': f"Failed to send alert to {device_id}: {str(e)}",
-                            'level': 'ERROR'
-                        })
+    def broadcast_alert(self, source_device_id, alert_message):
+        """Broadcast alert to all registered devices except the source"""
+        alert = {
+            'timestamp': datetime.now().isoformat(),
+            'source_device': source_device_id,
+            'message': alert_message
+        }
+        self.alerts.append(alert)
+        
+        # Keep only recent alerts (last 100)
+        if len(self.alerts) > 100:
+            self.alerts = self.alerts[-100:]
+            
+        if self.message_queue:
+            self.message_queue.put({
+                'type': 'log',
+                'content': f"Alert broadcast from {source_device_id}: {alert_message}",
+                'level': 'WARNING'
+            })
 
 class FogServerGUI:
     def __init__(self, root):
@@ -1382,10 +1389,16 @@ def create_app(message_queue):
             if last_alert_time:
                 last_alert_time = datetime.fromisoformat(last_alert_time)
             
-            # Get only new alerts since last check
-            alerts = []  # You'll implement alert storage
+            # Get alerts from device registry
+            alerts = []
+            for alert in device_registry.alerts:
+                alert_time = datetime.fromisoformat(alert['timestamp'])
+                
+                # Only include alerts after last_alert_time and not from the requesting device
+                if (not last_alert_time or alert_time > last_alert_time) and \
+                   alert['source_device'] != device_id:
+                    alerts.append(alert)
             
-            # Add rate limiting information to response
             return jsonify({
                 "alerts": alerts,
                 "next_poll": 10  # Suggest client wait 10 seconds
